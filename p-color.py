@@ -45,7 +45,7 @@ def hex_to_rgb(hex_str):
 def rgb_to_hex(r, g, b):
     return f"{r:02X}{g:02X}{b:02X}"
 
-# --- 1-A. 노란색 목폴라(polat_sweater.png) 마스크 추출 (목 피부 보호 + 하단 양옆 소매/틈 완전 포함) ---
+# --- 1-A. 노란색 목폴라(polat_sweater.png) 마스크 추출 ---
 @st.cache_data
 def get_yellow_sweater_mask(image_path):
     img = cv2.imread(image_path)
@@ -54,8 +54,6 @@ def get_yellow_sweater_mask(image_path):
     h, w, _ = img.shape
 
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    
-    # 1. 목 피부 그늘을 제외하기 위해 채도(S >= 115)와 색상(H: 16~34) 제한
     lower_yellow = np.array([16, 115, 65])
     upper_yellow = np.array([34, 255, 255])
     mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
@@ -74,22 +72,19 @@ def get_yellow_sweater_mask(image_path):
     )
     mask[neck_protect == 255] = 0
 
-    # 2. 니트 내부 미세 구멍 메우기
     kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
 
-    # 3. 가장 큰 연결 덩어리(스웨터 본체)만 남기고 피부 위 노이즈 제거
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     if num_labels > 1:
         largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
         mask = np.where(labels == largest_label, 255, 0).astype(np.uint8)
 
-    # 4. 하단부(허리~양쪽 소매 바깥 경계까지) 빈틈 없이 모두 채우기
+    # 하단부(허리~양쪽 소매 바깥 경계까지) 빈틈 없이 모두 채우기
     lower_start = int(h * 0.52)
     for y in range(lower_start, h):
         cols = np.where(mask[y, :] > 0)[0]
         if len(cols) > 0:
-            # 양쪽 소매 바깥 가장자리까지 여유 있게 확장하여 검은 테두리/빈틈 제거
             left_edge = 0 if cols[0] < int(w * 0.08) else cols[0]
             right_edge = w - 1 if cols[-1] > int(w * 0.92) else cols[-1]
             mask[y, left_edge:right_edge + 1] = 255
@@ -146,32 +141,36 @@ def get_white_tshirt_mask(image_path):
 
     return shirt_mask, img
 
-# --- 2. 추출된 의상 영역에 새 색상 적용 (하단 소매 틈새 어두운 그림자 평탄화 포함) ---
-def apply_clothing_color(img, mask, target_rgb, base_norm=235.0, smooth_lower_gaps=False):
+# --- 2. 추출된 의상 영역에 새 색상 적용 (음영 무시/적용 선택 지원) ---
+def apply_clothing_color(img, mask, target_rgb, base_norm=235.0, smooth_lower_gaps=False, use_shading=False):
     h, w, _ = img.shape
     img_float = img.astype(np.float32)
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    v_channel = hsv[:, :, 2].astype(np.float32)
-
-    shading = np.clip(v_channel / base_norm, 0.20, 1.05)
-
-    # 목폴라 하단부(허리와 팔 소매 사이 깊은 그림자 및 빈틈)가 검게 패여 보이지 않고
-    # 몸통 니트 색과 동일한 밝기로 자연스럽게 채워지도록 보정
-    if smooth_lower_gaps:
-        lower_y = int(h * 0.55)
-        lower_shading = shading[lower_y:, :].copy()
-        # 주변 니트 밝기(중앙 몸통 기준 평균 밝기 약 0.90)로 어두운 틈새를 끌어올림
-        deep_shadow = lower_shading < 0.80
-        lower_shading[deep_shadow] = np.clip(lower_shading[deep_shadow] * 0.35 + 0.62, 0.84, 0.94)
-        lower_shading = cv2.GaussianBlur(lower_shading, (9, 9), 0)
-        shading[lower_y:, :] = lower_shading
-
     b_t, g_t, r_t = target_rgb[2], target_rgb[1], target_rgb[0]
 
     colored_layer = np.zeros_like(img_float)
-    colored_layer[:, :, 0] = b_t * shading
-    colored_layer[:, :, 1] = g_t * shading
-    colored_layer[:, :, 2] = r_t * shading
+
+    if use_shading:
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        v_channel = hsv[:, :, 2].astype(np.float32)
+        shading = np.clip(v_channel / base_norm, 0.20, 1.05)
+
+        if smooth_lower_gaps:
+            lower_y = int(h * 0.55)
+            lower_shading = shading[lower_y:, :].copy()
+            deep_shadow = lower_shading < 0.80
+            lower_shading[deep_shadow] = np.clip(lower_shading[deep_shadow] * 0.35 + 0.62, 0.84, 0.94)
+            lower_shading = cv2.GaussianBlur(lower_shading, (9, 9), 0)
+            shading[lower_y:, :] = lower_shading
+
+        colored_layer[:, :, 0] = b_t * shading
+        colored_layer[:, :, 1] = g_t * shading
+        colored_layer[:, :, 2] = r_t * shading
+    else:
+        # 음영을 완전히 무시하고 선택한 순수 단색(Flat Color) 그대로 채움
+        colored_layer[:, :, 0] = b_t
+        colored_layer[:, :, 1] = g_t
+        colored_layer[:, :, 2] = r_t
+
     colored_layer = np.clip(colored_layer, 0, 255)
 
     mask_norm = (mask / 255.0)[:, :, np.newaxis]
@@ -330,41 +329,60 @@ def on_hex_change():
         except ValueError:
             pass
 
-# --- CSS 스타일: 네모 테두리 완전 제거 및 육각형 타일 밀착 ---
+# --- CSS 스타일: 모바일 세로 화면에서도 가로 벌집 팔레트 강제 유지 & 테두리 제거 ---
 st.markdown("""
 <style>
-section[data-testid="stSidebar"] div[data-testid="stHorizontalBlock"] div.stButton > button {
+/* 모바일 세로 화면에서도 사이드바 팔레트 컬럼이 세로로 줄바꿈되지 않도록 강제 가로 배치 */
+section[data-testid="stSidebar"] div[data-testid="stHorizontalBlock"] {
+    display: flex !important;
+    flex-direction: row !important;
+    flex-wrap: nowrap !important;
+    align-items: center !important;
+    justify-content: center !important;
+    gap: 2px !important;
+    margin-bottom: -10px !important;
+    width: 100% !important;
+}
+
+section[data-testid="stSidebar"] div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"],
+section[data-testid="stSidebar"] div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
+    min-width: 0px !important;
+    flex-shrink: 1 !important;
+    padding: 0px !important;
+}
+
+/* 사이드바 팔레트 버튼 테두리/배경 완전 제거 (모바일/데스크톱 공통) */
+section[data-testid="stSidebar"] div[data-testid="stHorizontalBlock"] button {
     border: none !important;
     outline: none !important;
     box-shadow: none !important;
+    background: transparent !important;
     background-color: transparent !important;
     padding: 0px !important;
-    min-height: 22px !important;
-    height: 22px !important;
+    min-height: 20px !important;
+    height: 20px !important;
     width: 100% !important;
+    min-width: 0px !important;
     margin: 0px !important;
     z-index: 2;
     position: relative;
 }
-section[data-testid="stSidebar"] div[data-testid="stHorizontalBlock"] div.stButton > button:hover,
-section[data-testid="stSidebar"] div[data-testid="stHorizontalBlock"] div.stButton > button:focus,
-section[data-testid="stSidebar"] div[data-testid="stHorizontalBlock"] div.stButton > button:active {
+
+section[data-testid="stSidebar"] div[data-testid="stHorizontalBlock"] button:hover,
+section[data-testid="stSidebar"] div[data-testid="stHorizontalBlock"] button:focus,
+section[data-testid="stSidebar"] div[data-testid="stHorizontalBlock"] button:active {
     border: none !important;
     outline: none !important;
     box-shadow: none !important;
-    background-color: transparent !important;
+    background: transparent !important;
 }
 
-section[data-testid="stSidebar"] div[data-testid="stHorizontalBlock"] {
-    gap: 2px !important;
-    margin-bottom: -10px !important;
-}
-
+/* 육각형 컬러 타일을 투명 버튼과 1:1 밀착 */
 .hex-swatch {
     width: 100%;
-    height: 22px;
+    height: 20px;
     clip-path: polygon(25% 0%, 75% 0%, 100% 50%, 75% 100%, 25% 100%, 0% 50%);
-    margin-top: -38px;
+    margin-top: -36px;
     pointer-events: none;
     position: relative;
     z-index: 1;
@@ -400,6 +418,9 @@ with st.sidebar:
         ["표준 (육각형 팔레트)", "사용자 지정 (스펙트럼 & 수치 입력)"],
         index=0
     )
+
+    # 음영 무시/적용 토글 (기본값 False = 음영 무시하고 순수 단색으로 변경)
+    use_shading = st.checkbox("옷 주름·음영 살리기 (체크 해제 시 단색 적용)", value=False)
     st.markdown("---")
 
     if selection_mode == "표준 (육각형 팔레트)":
@@ -507,9 +528,14 @@ if mask_turtle is None or mask_tshirt is None:
     st.error("폴더에 `polat_sweater.png`와 `polat_sweater01.png` 파일이 모두 있는지 확인해 주세요.")
     st.stop()
 
-# 목폴라는 하단 소매 틈새 평탄화(smooth_lower_gaps=True) 적용
-res_turtle = apply_clothing_color(img_turtle, mask_turtle, st.session_state.curr_rgb, base_norm=235.0, smooth_lower_gaps=True)
-res_tshirt = apply_clothing_color(img_tshirt, mask_tshirt, st.session_state.curr_rgb, base_norm=242.0, smooth_lower_gaps=False)
+res_turtle = apply_clothing_color(
+    img_turtle, mask_turtle, st.session_state.curr_rgb,
+    base_norm=235.0, smooth_lower_gaps=True, use_shading=use_shading
+)
+res_tshirt = apply_clothing_color(
+    img_tshirt, mask_tshirt, st.session_state.curr_rgb,
+    base_norm=242.0, smooth_lower_gaps=False, use_shading=use_shading
+)
 
 col_preview, col_ctrl = st.columns([1.45, 1])
 

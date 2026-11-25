@@ -6,7 +6,7 @@ from PIL import Image, ImageColor, ImageDraw
 from io import BytesIO
 import base64
 
-st.set_page_config(page_title="목폴라 실시간 컬러 체인저 (A4 출력 지원)", layout="wide")
+st.set_page_config(page_title="의상 실시간 컬러 체인저 & A4 출력", layout="wide")
 
 # --- 색상 변환 헬퍼 함수 ---
 def hsl_to_rgb(h, s, l):
@@ -45,7 +45,7 @@ def hex_to_rgb(hex_str):
 def rgb_to_hex(r, g, b):
     return f"{r:02X}{g:02X}{b:02X}"
 
-# --- 1. 노란색 목폴라 니트 영역 정밀 마스크 추출 ---
+# --- 1-A. 노란색 목폴라(polat_sweater.png) 마스크 추출 (목 피부 보호 + 하단 양옆 소매/틈 완전 포함) ---
 @st.cache_data
 def get_yellow_sweater_mask(image_path):
     img = cv2.imread(image_path)
@@ -54,28 +54,118 @@ def get_yellow_sweater_mask(image_path):
     h, w, _ = img.shape
 
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    lower_yellow = np.array([15, 110, 80])
+    
+    # 1. 목 피부 그늘을 제외하기 위해 채도(S >= 115)와 색상(H: 16~34) 제한
+    lower_yellow = np.array([16, 115, 65])
     upper_yellow = np.array([34, 255, 255])
     mask = cv2.inRange(hsv, lower_yellow, upper_yellow)
 
-    # 턱 위쪽 얼굴 영역 마스킹 제외
-    mask[0:int(h * 0.105), :] = 0
+    # 턱 위쪽 및 목 윗부분 확실히 제외
+    mask[0:int(h * 0.112), :] = 0
 
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    # 목폴라 윗단 안쪽 목 피부 보호 영역
+    neck_protect = np.zeros((h, w), dtype=np.uint8)
+    cv2.ellipse(
+        neck_protect,
+        center=(w // 2, int(h * 0.115)),
+        axes=(int(w * 0.185), int(h * 0.072)),
+        angle=0, startAngle=0, endAngle=180,
+        color=255, thickness=-1
+    )
+    mask[neck_protect == 255] = 0
+
+    # 2. 니트 내부 미세 구멍 메우기
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
-    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
+
+    # 3. 가장 큰 연결 덩어리(스웨터 본체)만 남기고 피부 위 노이즈 제거
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels > 1:
+        largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+        mask = np.where(labels == largest_label, 255, 0).astype(np.uint8)
+
+    # 4. 하단부(허리~양쪽 소매 바깥 경계까지) 빈틈 없이 모두 채우기
+    lower_start = int(h * 0.52)
+    for y in range(lower_start, h):
+        cols = np.where(mask[y, :] > 0)[0]
+        if len(cols) > 0:
+            # 양쪽 소매 바깥 가장자리까지 여유 있게 확장하여 검은 테두리/빈틈 제거
+            left_edge = 0 if cols[0] < int(w * 0.08) else cols[0]
+            right_edge = w - 1 if cols[-1] > int(w * 0.92) else cols[-1]
+            mask[y, left_edge:right_edge + 1] = 255
+
+    mask[int(h * 0.95):h, :] = 255
     mask = cv2.GaussianBlur(mask, (5, 5), 0)
 
     return mask, img
 
-# --- 2. 추출된 니트 영역에 새 색상 적용 ---
-def apply_clothing_color(img, mask, target_rgb):
+# --- 1-B. 흰색 U넥 티셔츠(polat_sweater01.png) 의상 영역 마스크 추출 ---
+@st.cache_data
+def get_white_tshirt_mask(image_path):
+    img = cv2.imread(image_path)
+    if img is None:
+        return None, None
+    h, w, _ = img.shape
+
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    s_ch = hsv[:, :, 1]
+    v_ch = hsv[:, :, 2]
+
+    is_white_fabric = (s_ch < 38) & (v_ch > 165)
+    raw_mask = np.where(is_white_fabric, 255, 0).astype(np.uint8)
+    raw_mask[0:int(h * 0.255), :] = 0
+
+    gc_mask = np.full((h, w), cv2.GC_PR_BGD, dtype=np.uint8)
+    gc_mask[0:int(h * 0.27), :] = cv2.GC_BGD
+    gc_mask[int(h * 0.27):int(h * 0.45), 0:int(w * 0.12)] = cv2.GC_PR_BGD
+    gc_mask[int(h * 0.27):int(h * 0.45), int(w * 0.88):w] = cv2.GC_PR_BGD
+
+    gc_mask[raw_mask == 255] = cv2.GC_PR_FGD
+    gc_mask[int(h * 0.62):h, int(w * 0.10):int(w * 0.90)] = cv2.GC_FGD
+    gc_mask[int(h * 0.32):h, 0:int(w * 0.14)] = cv2.GC_FGD
+    gc_mask[int(h * 0.32):h, int(w * 0.86):w] = cv2.GC_FGD
+    gc_mask[s_ch >= 38] = cv2.GC_BGD
+
+    bgdModel = np.zeros((1, 65), np.float64)
+    fgdModel = np.zeros((1, 65), np.float64)
+
+    scale = 0.5
+    small_img = cv2.resize(img, (0, 0), fx=scale, fy=scale)
+    small_gc = cv2.resize(gc_mask, (small_img.shape[1], small_img.shape[0]), interpolation=cv2.INTER_NEAREST)
+    cv2.grabCut(small_img, small_gc, None, bgdModel, fgdModel, 4, cv2.GC_INIT_WITH_MASK)
+
+    shirt_mask = np.where((small_gc == cv2.GC_FGD) | (small_gc == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+    shirt_mask = cv2.resize(shirt_mask, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    shirt_mask[s_ch >= 40] = 0
+    shirt_mask[0:int(h * 0.255), :] = 0
+
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    shirt_mask = cv2.morphologyEx(shirt_mask, cv2.MORPH_CLOSE, kernel_close)
+    shirt_mask = cv2.GaussianBlur(shirt_mask, (5, 5), 0)
+
+    return shirt_mask, img
+
+# --- 2. 추출된 의상 영역에 새 색상 적용 (하단 소매 틈새 어두운 그림자 평탄화 포함) ---
+def apply_clothing_color(img, mask, target_rgb, base_norm=235.0, smooth_lower_gaps=False):
+    h, w, _ = img.shape
     img_float = img.astype(np.float32)
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     v_channel = hsv[:, :, 2].astype(np.float32)
 
-    shading = np.clip(v_channel / 235.0, 0.20, 1.12)
+    shading = np.clip(v_channel / base_norm, 0.20, 1.05)
+
+    # 목폴라 하단부(허리와 팔 소매 사이 깊은 그림자 및 빈틈)가 검게 패여 보이지 않고
+    # 몸통 니트 색과 동일한 밝기로 자연스럽게 채워지도록 보정
+    if smooth_lower_gaps:
+        lower_y = int(h * 0.55)
+        lower_shading = shading[lower_y:, :].copy()
+        # 주변 니트 밝기(중앙 몸통 기준 평균 밝기 약 0.90)로 어두운 틈새를 끌어올림
+        deep_shadow = lower_shading < 0.80
+        lower_shading[deep_shadow] = np.clip(lower_shading[deep_shadow] * 0.35 + 0.62, 0.84, 0.94)
+        lower_shading = cv2.GaussianBlur(lower_shading, (9, 9), 0)
+        shading[lower_y:, :] = lower_shading
+
     b_t, g_t, r_t = target_rgb[2], target_rgb[1], target_rgb[0]
 
     colored_layer = np.zeros_like(img_float)
@@ -88,60 +178,84 @@ def apply_clothing_color(img, mask, target_rgb):
     final_img = img_float * (1.0 - mask_norm) + colored_layer * mask_norm
     return cv2.cvtColor(final_img.astype(np.uint8), cv2.COLOR_BGR2RGB)
 
-# --- 3. A4 용지(210mm x 297mm, 300 DPI) 규격 이미지 및 PDF 생성 ---
-def create_a4_sheet(colored_rgb_np, hex_code, rgb_val, hsl_val, fit_mode="여백 포함 맞춤 (추천)", include_info=True):
-    """
-    A4 (2480 x 3508 px, 300 DPI) 캔버스에 이미지를 배치합니다.
-    """
+# --- 3. A4 용지(210mm x 297mm, 300 DPI) 규격 이미지 생성 ---
+def create_a4_sheet(images_list, labels_list, hex_code, rgb_val, hsl_val, fit_mode="여백 포함 맞춤 (추천)", include_info=True):
     A4_W, A4_H = 2480, 3508
     a4_canvas = Image.new("RGB", (A4_W, A4_H), (255, 255, 255))
-    src_pil = Image.fromarray(colored_rgb_np)
-    src_w, src_h = src_pil.size
+    draw = ImageDraw.Draw(a4_canvas)
 
-    if fit_mode == "여백 포함 맞춤 (추천)":
-        margin_x = 180
-        margin_top = 180
-        margin_bottom = 320 if include_info else 180
-        avail_w = A4_W - margin_x * 2
-        avail_h = A4_H - margin_top - margin_bottom
+    num_imgs = len(images_list)
 
-        scale = min(avail_w / src_w, avail_h / src_h)
-        new_w = int(src_w * scale)
-        new_h = int(src_h * scale)
-        resized = src_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    if num_imgs == 1:
+        src_pil = Image.fromarray(images_list[0])
+        src_w, src_h = src_pil.size
 
-        paste_x = (A4_W - new_w) // 2
-        paste_y = margin_top + (avail_h - new_h) // 2
-        a4_canvas.paste(resized, (paste_x, paste_y))
+        if fit_mode == "여백 포함 맞춤 (추천)":
+            margin_x = 180
+            margin_top = 180
+            margin_bottom = 320 if include_info else 180
+            avail_w = A4_W - margin_x * 2
+            avail_h = A4_H - margin_top - margin_bottom
+
+            scale = min(avail_w / src_w, avail_h / src_h)
+            new_w, new_h = int(src_w * scale), int(src_h * scale)
+            resized = src_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+            paste_x = (A4_W - new_w) // 2
+            paste_y = margin_top + (avail_h - new_h) // 2
+            a4_canvas.paste(resized, (paste_x, paste_y))
+
+            if include_info:
+                box_x = paste_x
+                box_y = paste_y + new_h + 50
+                draw.rectangle([box_x, box_y, box_x + 110, box_y + 110], fill=rgb_val, outline=(80, 80, 80), width=3)
+                info_text_1 = f"ITEM : {labels_list[0]}   |   COLOR : #{hex_code}   |   RGB : ({rgb_val[0]}, {rgb_val[1]}, {rgb_val[2]})"
+                info_text_2 = f"HSL (240) : ({hsl_val[0]}, {hsl_val[1]}, {hsl_val[2]})   |   PAPER : A4 (210 x 297 mm, 300 DPI)"
+                draw.text((box_x + 140, box_y + 18), info_text_1, fill=(30, 30, 30), font_size=34)
+                draw.text((box_x + 140, box_y + 68), info_text_2, fill=(90, 90, 90), font_size=28)
+        else:
+            scale = max(A4_W / src_w, A4_H / src_h)
+            new_w, new_h = int(src_w * scale), int(src_h * scale)
+            resized = src_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+            crop_x = (new_w - A4_W) // 2
+            crop_y = (new_h - A4_H) // 2
+            a4_canvas = resized.crop((crop_x, crop_y, crop_x + A4_W, crop_y + A4_H))
+
+    else:
+        margin_x = 140
+        gap_x = 80
+        margin_top = 340
+        margin_bottom = 450 if include_info else 300
+
+        slot_w = (A4_W - margin_x * 2 - gap_x) // 2
+        slot_h = A4_H - margin_top - margin_bottom
+
+        for idx, (img_np, lbl) in enumerate(zip(images_list, labels_list)):
+            src_pil = Image.fromarray(img_np)
+            src_w, src_h = src_pil.size
+            scale = min(slot_w / src_w, slot_h / src_h)
+            new_w, new_h = int(src_w * scale), int(src_h * scale)
+            resized = src_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+            slot_x = margin_x + idx * (slot_w + gap_x)
+            paste_x = slot_x + (slot_w - new_w) // 2
+            paste_y = margin_top + (slot_h - new_h) // 2
+            a4_canvas.paste(resized, (paste_x, paste_y))
+
+            draw.text((paste_x, paste_y - 60), lbl, fill=(40, 40, 40), font_size=36)
 
         if include_info:
-            draw = ImageDraw.Draw(a4_canvas)
-            # 하단 컬러 스와치 박스 그리기
-            box_x = paste_x
-            box_y = paste_y + new_h + 50
-            draw.rectangle([box_x, box_y, box_x + 110, box_y + 110], fill=rgb_val, outline=(80, 80, 80), width=3)
-            
-            # 영문/숫자 기반 컬러 스펙 텍스트 표기 (기본 폰트 깨짐 방지)
+            box_x = margin_x
+            box_y = A4_H - margin_bottom + 70
+            draw.rectangle([box_x, box_y, box_x + 120, box_y + 120], fill=rgb_val, outline=(80, 80, 80), width=3)
             info_text_1 = f"COLOR CODE : #{hex_code}   |   RGB : ({rgb_val[0]}, {rgb_val[1]}, {rgb_val[2]})"
             info_text_2 = f"HSL (240)  : ({hsl_val[0]}, {hsl_val[1]}, {hsl_val[2]})   |   PAPER : A4 (210 x 297 mm, 300 DPI)"
-            draw.text((box_x + 140, box_y + 18), info_text_1, fill=(30, 30, 30), font_size=36)
-            draw.text((box_x + 140, box_y + 68), info_text_2, fill=(90, 90, 90), font_size=30)
-    else:
-        # A4 용지 전체 꽉 채우기 (중앙 크롭)
-        scale = max(A4_W / src_w, A4_H / src_h)
-        new_w = int(src_w * scale)
-        new_h = int(src_h * scale)
-        resized = src_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
-        crop_x = (new_w - A4_W) // 2
-        crop_y = (new_h - A4_H) // 2
-        a4_canvas = resized.crop((crop_x, crop_y, crop_x + A4_W, crop_y + A4_H))
+            draw.text((box_x + 150, box_y + 20), info_text_1, fill=(30, 30, 30), font_size=38)
+            draw.text((box_x + 150, box_y + 74), info_text_2, fill=(90, 90, 90), font_size=30)
 
     return a4_canvas
 
 def create_a4_pdf_bytes(a4_pil_image):
-    """
-    A4 PIL 이미지를 실제 210mm x 297mm 규격의 PDF 바이트로 변환합니다.
-    """
     try:
         from reportlab.pdfgen import canvas
         from reportlab.lib.pagesizes import A4
@@ -149,7 +263,7 @@ def create_a4_pdf_bytes(a4_pil_image):
 
         pdf_buf = BytesIO()
         c = canvas.Canvas(pdf_buf, pagesize=A4)
-        page_w, page_h = A4  # 595.27 x 841.89 points (210mm x 297mm)
+        page_w, page_h = A4
 
         img_buf = BytesIO()
         a4_pil_image.save(img_buf, format="JPEG", quality=95)
@@ -160,7 +274,6 @@ def create_a4_pdf_bytes(a4_pil_image):
         c.save()
         return pdf_buf.getvalue()
     except ImportError:
-        # reportlab 미설치 시 Pillow 내장 PDF 저장 기능으로 대체
         pdf_buf = BytesIO()
         a4_pil_image.save(pdf_buf, format="PDF", resolution=300.0)
         return pdf_buf.getvalue()
@@ -273,15 +386,6 @@ section[data-testid="stSidebar"] div[data-testid="stHorizontalBlock"] {
     background: linear-gradient(to right, #000000 0%, #808080 50%, #ffffff 100%);
     margin-bottom: -8px;
 }
-
-/* A4 용지 미리보기 외곽 그림자 효과 */
-.a4-preview-frame {
-    border: 1px solid #bbb;
-    box-shadow: 0 6px 18px rgba(0,0,0,0.25);
-    background: white;
-    padding: 4px;
-    border-radius: 2px;
-}
 </style>
 """, unsafe_allow_html=True)
 
@@ -298,7 +402,6 @@ with st.sidebar:
     )
     st.markdown("---")
 
-    # 1. [표준] 육각형 팔레트
     if selection_mode == "표준 (육각형 팔레트)":
         st.caption("색(C):")
         hex_honeycomb = [
@@ -334,7 +437,6 @@ with st.sidebar:
                           on_click=on_standard_click, args=(g_hex,), use_container_width=True)
                 st.markdown(f'<div class="hex-swatch" style="background-color:{g_hex};"></div>', unsafe_allow_html=True)
 
-    # 2. [사용자 지정] 스펙트럼 + 명도 슬라이더 + 색 모델(RGB/HSL) 입력창
     else:
         st.caption("색(C):")
         st.markdown('<div class="spectrum-bar"></div>', unsafe_allow_html=True)
@@ -380,7 +482,6 @@ with st.sidebar:
     st.markdown("<div style='height: 12px;'></div>", unsafe_allow_html=True)
     st.markdown("---")
 
-    # 3. '새 색 / 현재 색' 비교 박스
     prev_hex = rgb_to_hex(*st.session_state.prev_rgb)
     curr_hex = st.session_state.curr_hex
     st.markdown(f"""
@@ -395,35 +496,58 @@ with st.sidebar:
     """, unsafe_allow_html=True)
 
 # =====================================================================
-# [오른쪽 메인 영역] A4 규격 레이아웃 미리보기 & 인쇄/출력
+# [오른쪽 메인 영역] 목폴라 & U넥 티셔츠 동시 색상 변경 및 A4 출력
 # =====================================================================
-st.title("🧶 목폴라 실시간 컬러 체인저 & A4 출력")
+st.title("🧶 의상 실시간 컬러 체인저 & A4 출력")
 
-sweater_mask, cv_img = get_yellow_sweater_mask("polat_sweater.png")
-if sweater_mask is None:
-    st.error("폴더에 `polat_sweater.png` 파일이 없습니다. `app.py`와 같은 폴더에 파일을 넣어주세요.")
+mask_turtle, img_turtle = get_yellow_sweater_mask("polat_sweater.png")
+mask_tshirt, img_tshirt = get_white_tshirt_mask("polat_sweater01.png")
+
+if mask_turtle is None or mask_tshirt is None:
+    st.error("폴더에 `polat_sweater.png`와 `polat_sweater01.png` 파일이 모두 있는지 확인해 주세요.")
     st.stop()
 
-colored_result = apply_clothing_color(cv_img, sweater_mask, st.session_state.curr_rgb)
+# 목폴라는 하단 소매 틈새 평탄화(smooth_lower_gaps=True) 적용
+res_turtle = apply_clothing_color(img_turtle, mask_turtle, st.session_state.curr_rgb, base_norm=235.0, smooth_lower_gaps=True)
+res_tshirt = apply_clothing_color(img_tshirt, mask_tshirt, st.session_state.curr_rgb, base_norm=242.0, smooth_lower_gaps=False)
 
-col_a4, col_ctrl = st.columns([1.35, 1])
+col_preview, col_ctrl = st.columns([1.45, 1])
 
 with col_ctrl:
-    st.subheader("🖨️ A4 출력 설정")
-    fit_mode = st.radio(
-        "A4 용지 배치 방식",
-        ["여백 포함 맞춤 (추천)", "A4 용지 전체 꽉 채우기"],
+    st.subheader("🖨️ A4 출력 대상 & 설정")
+    
+    print_target = st.radio(
+        "A4 출력 이미지 선택",
+        [
+            "목폴라 + U넥 티셔츠 (2종 함께 A4 배치)",
+            "목폴라 단독 (polat_sweater.png)",
+            "U넥 티셔츠 단독 (polat_sweater01.png)"
+        ],
         index=0
     )
+
+    if print_target.startswith("목폴라 + U넥"):
+        selected_imgs = [res_turtle, res_tshirt]
+        selected_labels = ["TURTLENECK (polat_sweater)", "U-NECK TEE (polat_sweater01)"]
+        fit_mode = "여백 포함 맞춤 (추천)"
+    elif print_target.startswith("목폴라 단독"):
+        selected_imgs = [res_turtle]
+        selected_labels = ["TURTLENECK (polat_sweater)"]
+        fit_mode = st.radio("A4 용지 배치 방식", ["여백 포함 맞춤 (추천)", "A4 용지 전체 꽉 채우기"], index=0)
+    else:
+        selected_imgs = [res_tshirt]
+        selected_labels = ["U-NECK TEE (polat_sweater01)"]
+        fit_mode = st.radio("A4 용지 배치 방식", ["여백 포함 맞춤 (추천)", "A4 용지 전체 꽉 채우기"], index=0)
+
     include_info = st.checkbox(
         "하단에 색상 코드(HEX/RGB/HSL) 스와치 표기",
         value=True,
-        disabled=(fit_mode == "A4 용지 전체 꽉 채우기")
+        disabled=(len(selected_imgs) == 1 and fit_mode == "A4 용지 전체 꽉 채우기")
     )
 
-    # A4 규격(2480 x 3508 px, 300 DPI) 생성
     a4_pil = create_a4_sheet(
-        colored_result,
+        selected_imgs,
+        selected_labels,
         st.session_state.curr_hex,
         st.session_state.curr_rgb,
         st.session_state.curr_hsl,
@@ -432,7 +556,7 @@ with col_ctrl:
     )
 
     st.markdown("---")
-    st.subheader("현재 적용된 색상 정보")
+    st.subheader("적용된 색상 정보")
     st.write(f"- **HEX 코드:** `#{st.session_state.curr_hex}`")
     st.write(f"- **RGB:** `{st.session_state.curr_rgb[0]}, {st.session_state.curr_rgb[1]}, {st.session_state.curr_rgb[2]}`")
     st.write(f"- **HSL (240 기준):** `{st.session_state.curr_hsl[0]}, {st.session_state.curr_hsl[1]}, {st.session_state.curr_hsl[2]}`")
@@ -440,28 +564,46 @@ with col_ctrl:
 
     st.markdown("---")
 
-    # 1. A4 PDF 다운로드 버튼
     pdf_bytes = create_a4_pdf_bytes(a4_pil)
     st.download_button(
         label="📄 A4 인쇄용 PDF 다운로드 (.pdf)",
         data=pdf_bytes,
-        file_name=f"turtleneck_A4_{st.session_state.curr_hex}.pdf",
+        file_name=f"garments_A4_{st.session_state.curr_hex}.pdf",
         mime="application/pdf",
         use_container_width=True
     )
 
-    # 2. A4 고해상도 PNG 다운로드 버튼
     png_buf = BytesIO()
     a4_pil.save(png_buf, format="PNG", dpi=(300, 300))
     st.download_button(
         label="🖼️ A4 고해상도 이미지 다운로드 (.png)",
         data=png_buf.getvalue(),
-        file_name=f"turtleneck_A4_{st.session_state.curr_hex}.png",
+        file_name=f"garments_A4_{st.session_state.curr_hex}.png",
         mime="image/png",
         use_container_width=True
     )
 
-    # 3. 브라우저 즉시 인쇄 버튼 (A4 세로 규격 @page 적용)
+    c_dl1, c_dl2 = st.columns(2)
+    buf1 = BytesIO()
+    Image.fromarray(res_turtle).save(buf1, format="PNG")
+    c_dl1.download_button(
+        label="📥 목폴라 개별 PNG",
+        data=buf1.getvalue(),
+        file_name=f"turtleneck_{st.session_state.curr_hex}.png",
+        mime="image/png",
+        use_container_width=True
+    )
+
+    buf2 = BytesIO()
+    Image.fromarray(res_tshirt).save(buf2, format="PNG")
+    c_dl2.download_button(
+        label="📥 U넥 티셔츠 개별 PNG",
+        data=buf2.getvalue(),
+        file_name=f"uneck_{st.session_state.curr_hex}.png",
+        mime="image/png",
+        use_container_width=True
+    )
+
     preview_buf = BytesIO()
     a4_pil.resize((1240, 1754), Image.Resampling.LANCZOS).save(preview_buf, format="JPEG", quality=92)
     b64_img = base64.b64encode(preview_buf.getvalue()).decode()
@@ -511,13 +653,19 @@ with col_ctrl:
         font-size: 15px;
         font-weight: 600;
         cursor: pointer;
-        margin-top: 4px;
+        margin-top: 6px;
     ">🖨️ 프린터로 바로 A4 인쇄하기</button>
     """
-    components.html(print_html, height=55)
+    components.html(print_html, height=58)
 
-with col_a4:
-    st.subheader("A4 출력 미리보기 (210mm × 297mm)")
-    # 화면 렌더링 속도를 위해 미리보기용 리사이즈 이미지 표시
-    a4_preview = a4_pil.resize((840, 1188), Image.Resampling.LANCZOS)
-    st.image(a4_preview, use_container_width=True, caption=f"A4 레이아웃 미리보기 | #{st.session_state.curr_hex}")
+with col_preview:
+    tab_a4, tab_both = st.tabs(["📄 A4 출력 미리보기", "👕 2종 실시간 비교 보기"])
+
+    with tab_a4:
+        a4_preview = a4_pil.resize((840, 1188), Image.Resampling.LANCZOS)
+        st.image(a4_preview, use_container_width=True, caption=f"A4 출력 레이아웃 (210mm × 297mm) | #{st.session_state.curr_hex}")
+
+    with tab_both:
+        c_img1, c_img2 = st.columns(2)
+        c_img1.image(res_turtle, use_container_width=True, caption=f"목폴라 (#{st.session_state.curr_hex})")
+        c_img2.image(res_tshirt, use_container_width=True, caption=f"U넥 티셔츠 (#{st.session_state.curr_hex})")
